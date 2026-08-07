@@ -1,0 +1,40 @@
+{
+  "variables": [
+    {
+      "name": "ADMIN_USERNAME",
+      "description": "Username for the single protected admin account.",
+      "example": "admin",
+      "required": true
+    },
+    {
+      "name": "ADMIN_PASSWORD",
+      "description": "Password for the single protected admin account. Change the first-run placeholder before real deployment.",
+      "example": "change-me-now",
+      "required": true
+    },
+    {
+      "name": "SESSION_SECRET",
+      "description": "Secret key used to sign admin session cookies.",
+      "example": "replace-with-a-long-random-secret",
+      "required": true
+    },
+    {
+      "name": "DB_PATH",
+      "description": "Path to the primary SQLite database used for the login failure ledger.",
+      "example": "data/main.sqlite",
+      "required": false
+    },
+    {
+      "name": "PORT",
+      "description": "HTTP port the application listens on.",
+      "example": "9876",
+      "required": false
+    },
+    {
+      "name": "TRUST_PROXY",
+      "description": "Whether to trust X-Forwarded-For and X-Real-IP headers from a known reverse proxy.",
+      "example": "false",
+      "required": false
+    }
+  ]
+}
