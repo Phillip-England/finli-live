@@ -3,6 +3,7 @@ module github.com/phillip-england/finli-live
 go 1.25.3
 
 require (
+	github.com/jung-kurt/gofpdf v1.16.2
 	github.com/pdfcpu/pdfcpu v0.12.1
 	modernc.org/sqlite v1.56.0
 )

@@ -1,6 +1,6 @@
 # Finli Live
 
-Finli Live wraps the `finli` CLI in a local web app. It uploads a receipt directory, runs `finli sort`, generates location-specific invoices with `finli generate`, then merges each invoice with its sorted receipt PDFs into separate location PDFs.
+Finli Live is a local web app for turning receipt PDFs into location-specific invoice packets. It uploads a receipt directory, sorts and splits receipts by location, generates location-specific invoice pages, then merges each invoice with its sorted receipt PDFs into separate location PDFs.
 
 ## Locations
 
@@ -16,9 +16,6 @@ If no `locations.json` file is uploaded, the app falls back to the original Sout
 ## Requirements
 
 - Go
-- `finli` installed and available on `PATH`
-
-If `finli` is missing, the app exits at startup and points you to `github.com/phillip-england/finli`.
 
 ## Install
 

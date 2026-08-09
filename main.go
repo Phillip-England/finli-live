@@ -1,7 +1,6 @@
 package main
 
 import (
-	"bytes"
 	"crypto/hmac"
 	"crypto/rand"
 	"crypto/sha256"
@@ -19,7 +18,6 @@ import (
 	"net"
 	"net/http"
 	"os"
-	"os/exec"
 	"path/filepath"
 	"sort"
 	"strconv"
@@ -27,6 +25,7 @@ import (
 	"sync"
 	"time"
 
+	"github.com/jung-kurt/gofpdf"
 	"github.com/pdfcpu/pdfcpu/pkg/api"
 	"github.com/pdfcpu/pdfcpu/pkg/pdfcpu/model"
 	_ "modernc.org/sqlite"
@@ -64,7 +63,7 @@ var publicPage = template.Must(template.New("public").Parse(`<!doctype html>
   <section class="intro">
     <p class="eyebrow">Invoice assembly for finli receipts</p>
     <h2>Turn a receipt folder into ready-to-send invoice packets.</h2>
-    <p>Finli Live is the browser interface for the finli invoice workflow. It takes a flat folder of PDF receipts, runs the same sorting and generation steps as the command line, and returns complete location-specific PDF packets for download.</p>
+    <p>Finli Live is a browser-based invoice workflow. It takes a flat folder of PDF receipts, sorts and splits them by location, generates invoice pages, and returns complete location-specific PDF packets for download.</p>
     <div class="cta-row">
       <a class="button-link" href="https://github.com/phillip-england/finli-live">Try it on GitHub</a>
       <a href="#workflow">See how it works</a>
@@ -87,7 +86,7 @@ var publicPage = template.Must(template.New("public").Parse(`<!doctype html>
       <article>
         <span class="step-number">01</span>
         <h4>Prepare the receipt folder</h4>
-        <p>Collect the receipt PDFs that belong in the invoice batch. Keep them in one folder with no nested folders, and make sure the files are PDFs named in the format expected by finli.</p>
+        <p>Collect the receipt PDFs that belong in the invoice batch. Keep them in one folder with no nested folders, and make sure the files follow the Finli receipt filename format.</p>
       </article>
       <article>
         <span class="step-number">02</span>
@@ -110,10 +109,10 @@ var publicPage = template.Must(template.New("public").Parse(`<!doctype html>
   <section class="band">
     <div class="section-heading">
       <p class="eyebrow">What Finli Live does for you</p>
-      <h3>It wraps the command-line workflow in a focused web tool.</h3>
+      <h3>It runs the full invoice workflow in a focused web tool.</h3>
     </div>
     <div class="grid">
-      <div><strong>Sorts receipts by location</strong><span>Runs finli sorting so uploaded PDFs are separated into the selected location groups.</span></div>
+      <div><strong>Sorts receipts by location</strong><span>Separates uploaded PDFs into the configured location groups and splits shared receipts accurately.</span></div>
       <div><strong>Generates invoice pages</strong><span>Creates the location-specific invoice cover pages using the supplied invoice name.</span></div>
       <div><strong>Merges final packets</strong><span>Combines each invoice page with its sorted receipt PDFs into a single downloadable document.</span></div>
       <div><strong>Supports location targeting</strong><span>Uses locations.json and split targets to generate every location or only a selected subset.</span></div>
@@ -129,7 +128,7 @@ var publicPage = template.Must(template.New("public").Parse(`<!doctype html>
       <ul>
         <li>Use one flat folder only; do not include subfolders.</li>
         <li>Upload PDF receipts only.</li>
-        <li>Use filenames that finli can recognize and sort.</li>
+        <li>Use filenames in the Finli receipt format.</li>
         <li>Remove duplicate, unrelated, or unfinished receipt files before generating the packet.</li>
       </ul>
     </div>
@@ -201,7 +200,7 @@ var adminPage = template.Must(template.New("admin").Parse(`<!doctype html>
     <label>
       Receipt directory
       <input name="receipts" type="file" webkitdirectory directory multiple required>
-      <span class="hint">Files must be PDFs named for finli. You may also include one top-level locations.json file. Uploaded directories cannot contain nested folders.</span>
+      <span class="hint">Files must be PDFs named in the Finli receipt format. You may also include one top-level locations.json file. Uploaded directories cannot contain nested folders.</span>
     </label>
     <label>
       Location target
@@ -614,9 +613,6 @@ func main() {
 	cfg, err := loadConfig()
 	if err != nil {
 		log.Fatal(err)
-	}
-	if _, err := exec.LookPath("finli"); err != nil {
-		log.Fatalf("finli is not installed or is not on PATH. Install it from github.com/phillip-england/finli")
 	}
 	if err := os.MkdirAll(jobsDir, 0o755); err != nil {
 		log.Fatalf("failed to create %s: %v", jobsDir, err)
@@ -1132,7 +1128,7 @@ func runJob(w http.ResponseWriter, r *http.Request) (jobResult, error) {
 		return jobResult{}, err
 	}
 
-	if err := runFinli(jobRoot, "sort", uploadDir, sortedDir); err != nil {
+	if err := sortReceipts(uploadDir, sortedDir, locations); err != nil {
 		return jobResult{}, err
 	}
 
@@ -1175,7 +1171,7 @@ func generateLocationInvoices(sortedDir, workDir, invoiceName string, locations 
 		}
 
 		locationInvoiceName := invoiceName + " " + loc.TitleSuffix
-		if err := runFinli(locationWorkDir, "generate", receiptDir, locationInvoiceName); err != nil {
+		if err := generateInvoicePDF(locationWorkDir, receiptDir, locationInvoiceName); err != nil {
 			return nil, err
 		}
 
@@ -1415,16 +1411,290 @@ func writeUpload(target string, src multipart.File) error {
 	return nil
 }
 
-func runFinli(dir string, args ...string) error {
-	cmd := exec.Command("finli", args...)
-	cmd.Dir = dir
-	var out bytes.Buffer
-	cmd.Stdout = &out
-	cmd.Stderr = &out
-	if err := cmd.Run(); err != nil {
-		return fmt.Errorf("FINLI FAILURE: finli %s failed\n%s", strings.Join(args, " "), strings.TrimSpace(out.String()))
+type invoiceLineItem struct {
+	SourceDir   string
+	Path        string
+	TrimmedPath string
+	Date        string
+	Vendor      string
+	CostCents   int64
+	Description string
+	Category    string
+	Location    string
+}
+
+type expenseCategory struct {
+	Name      string
+	LineItems []invoiceLineItem
+	Total     int64
+}
+
+func sortReceipts(sourceDir, outDir string, locations []locationSpec) error {
+	lineItems, err := lineItemsFromDir(sourceDir, locations)
+	if err != nil {
+		return err
+	}
+
+	for _, loc := range locations {
+		if err := os.MkdirAll(filepath.Join(outDir, loc.Slug), 0o755); err != nil {
+			return fmt.Errorf("FAILED TO CREATE DIR: failed to create %s: %w", loc.Slug, err)
+		}
+	}
+
+	for _, item := range lineItems {
+		if item.Location == "split" {
+			splits, err := splitLineItem(item, locations)
+			if err != nil {
+				return err
+			}
+			for _, split := range splits {
+				if err := copyLineItem(item.Path, outDir, split); err != nil {
+					return err
+				}
+			}
+			continue
+		}
+		if err := copyLineItem(item.Path, outDir, item); err != nil {
+			return err
+		}
 	}
 	return nil
+}
+
+func splitLineItem(item invoiceLineItem, locations []locationSpec) ([]invoiceLineItem, error) {
+	if len(locations) == 0 {
+		return nil, errors.New("PDF SPLIT ERROR: cannot split a receipt without locations")
+	}
+	base := item.CostCents / int64(len(locations))
+	remainder := item.CostCents % int64(len(locations))
+	splits := make([]invoiceLineItem, 0, len(locations))
+	var total int64
+	for i, loc := range locations {
+		split := item
+		split.Location = loc.Slug
+		split.CostCents = base
+		if int64(i) >= int64(len(locations))-remainder {
+			split.CostCents++
+		}
+		total += split.CostCents
+		splits = append(splits, split)
+	}
+	if total != item.CostCents {
+		return nil, fmt.Errorf("PDF SPLIT ERROR: split costs do not equal original cost for %s", item.TrimmedPath)
+	}
+	return splits, nil
+}
+
+func copyLineItem(sourcePath, outDir string, item invoiceLineItem) error {
+	destDir := filepath.Join(outDir, item.Location)
+	if err := os.MkdirAll(destDir, 0o755); err != nil {
+		return fmt.Errorf("FAILED TO CREATE DIR: failed to create %s: %w", destDir, err)
+	}
+	dest := filepath.Join(destDir, lineItemFileName(item))
+	src, err := os.Open(sourcePath)
+	if err != nil {
+		return fmt.Errorf("FILE COPY FAILURE: failed to open %s: %w", sourcePath, err)
+	}
+	defer src.Close()
+	dst, err := os.OpenFile(dest, os.O_WRONLY|os.O_CREATE|os.O_EXCL, 0o644)
+	if err != nil {
+		return fmt.Errorf("FILE COPY FAILURE: failed to create %s: %w", dest, err)
+	}
+	if _, err := io.Copy(dst, src); err != nil {
+		_ = dst.Close()
+		return fmt.Errorf("FILE COPY FAILURE: failed to copy %s to %s: %w", sourcePath, dest, err)
+	}
+	if err := dst.Close(); err != nil {
+		return fmt.Errorf("FILE COPY FAILURE: failed to close %s: %w", dest, err)
+	}
+	return nil
+}
+
+func lineItemFileName(item invoiceLineItem) string {
+	return strings.Join([]string{
+		item.Date,
+		item.Vendor,
+		formatCents(item.CostCents),
+		item.Description,
+		item.Category,
+		item.Location + ".pdf",
+	}, "-")
+}
+
+func lineItemsFromDir(sourceDir string, locations []locationSpec) ([]invoiceLineItem, error) {
+	allowedLocations := make(map[string]struct{}, len(locations)+1)
+	allowedLocations["split"] = struct{}{}
+	for _, loc := range locations {
+		allowedLocations[loc.Slug] = struct{}{}
+	}
+
+	var items []invoiceLineItem
+	err := filepath.WalkDir(sourceDir, func(path string, entry fs.DirEntry, walkErr error) error {
+		if walkErr != nil {
+			return walkErr
+		}
+		if path == sourceDir {
+			return nil
+		}
+		if entry.IsDir() {
+			return errors.New("INVALID DIR CONTENTS: the provided file path must not contain any subdirectories")
+		}
+		if strings.ToLower(filepath.Ext(path)) != ".pdf" {
+			return errors.New("INVALID FILE EXTENSION: the dir must contain only .pdf files")
+		}
+		item, err := newLineItem(sourceDir, path, allowedLocations)
+		if err != nil {
+			return err
+		}
+		items = append(items, item)
+		return nil
+	})
+	if err != nil {
+		return nil, fmt.Errorf("PDF DISCOVERY FAILURE: %w", err)
+	}
+	return items, nil
+}
+
+func newLineItem(sourceDir, path string, allowedLocations map[string]struct{}) (invoiceLineItem, error) {
+	rel, err := filepath.Rel(sourceDir, path)
+	if err != nil {
+		return invoiceLineItem{}, fmt.Errorf("INVALID FILE NAME: failed to resolve receipt path: %w", err)
+	}
+	trimmedPath := filepath.ToSlash(rel)
+	parts := strings.Split(trimmedPath, "-")
+	if len(parts) != 6 {
+		return invoiceLineItem{}, fmt.Errorf("INVALID FILE NAME: PdfLineItem must consist of 6 distinct parts but you provided %d\n%s", len(parts), trimmedPath)
+	}
+
+	date := parts[0]
+	if len(date) != 6 {
+		return invoiceLineItem{}, fmt.Errorf("INVALID DATE: PdfLineItem 'date' field should only consist of 6 digits like '010125'\n%s", trimmedPath)
+	}
+	if _, err := strconv.Atoi(date); err != nil {
+		return invoiceLineItem{}, fmt.Errorf("INVALID DATE: PdfLineItem 'date' field should be a valid number\n%s", trimmedPath)
+	}
+
+	costCents, err := parseCostCents(parts[2])
+	if err != nil {
+		return invoiceLineItem{}, fmt.Errorf("INVALID COST: PdfLineItem 'cost' failed to convert to a decimal dollar amount\n%s", trimmedPath)
+	}
+
+	locationName := strings.TrimSuffix(strings.ToLower(parts[5]), ".pdf")
+	location := locationSlug(locationName)
+	if _, ok := allowedLocations[location]; !ok {
+		return invoiceLineItem{}, fmt.Errorf("INVALID LOCATION: the 'location' field must be one of the configured locations or split\n%s", trimmedPath)
+	}
+
+	return invoiceLineItem{
+		SourceDir:   sourceDir,
+		Path:        path,
+		TrimmedPath: trimmedPath,
+		Date:        date,
+		Vendor:      parts[1],
+		CostCents:   costCents,
+		Description: parts[3],
+		Category:    parts[4],
+		Location:    location,
+	}, nil
+}
+
+func parseCostCents(value string) (int64, error) {
+	value = strings.TrimSpace(value)
+	if value == "" {
+		return 0, errors.New("blank cost")
+	}
+	dollars, cents, hasCents := strings.Cut(value, ".")
+	if dollars == "" {
+		dollars = "0"
+	}
+	if strings.HasPrefix(dollars, "-") {
+		return 0, errors.New("negative cost")
+	}
+	dollarPart, err := strconv.ParseInt(dollars, 10, 64)
+	if err != nil {
+		return 0, err
+	}
+	if !hasCents {
+		return dollarPart * 100, nil
+	}
+	if len(cents) == 0 || len(cents) > 2 {
+		return 0, errors.New("invalid cents")
+	}
+	for len(cents) < 2 {
+		cents += "0"
+	}
+	centPart, err := strconv.ParseInt(cents, 10, 64)
+	if err != nil {
+		return 0, err
+	}
+	return dollarPart*100 + centPart, nil
+}
+
+func formatCents(cents int64) string {
+	dollars := cents / 100
+	remainder := cents % 100
+	if remainder == 0 {
+		return strconv.FormatInt(dollars, 10)
+	}
+	if remainder%10 == 0 {
+		return fmt.Sprintf("%d.%d", dollars, remainder/10)
+	}
+	return fmt.Sprintf("%d.%02d", dollars, remainder)
+}
+
+func generateInvoicePDF(workDir, receiptDir, invoiceName string) error {
+	lineItems, err := lineItemsFromDir(receiptDir, []locationSpec{mustLocationSpec(filepath.Base(receiptDir))})
+	if err != nil {
+		return err
+	}
+	categories := expenseCategories(lineItems)
+	total := int64(0)
+	for _, category := range categories {
+		total += category.Total
+	}
+
+	pdf := gofpdf.New("P", "mm", "Letter", "")
+	pdf.SetTitle(invoiceName, false)
+	pdf.SetMargins(10, 10, 10)
+	pdf.SetAutoPageBreak(true, 10)
+	pdf.AddPage()
+	pdf.SetFont("Helvetica", "B", 20)
+	pdf.CellFormat(0, 10, fmt.Sprintf("%s: %s", invoiceName, formatCents(total)), "", 1, "L", false, 0, "")
+	pdf.Ln(12)
+
+	for _, category := range categories {
+		pdf.SetFont("Helvetica", "B", 16)
+		pdf.CellFormat(0, 8, fmt.Sprintf("%s => %s", category.Name, formatCents(category.Total)), "", 1, "L", false, 0, "")
+		pdf.Ln(1)
+		pdf.SetFont("Helvetica", "", 12)
+		for _, item := range category.LineItems {
+			pdf.MultiCell(0, 6, fmt.Sprintf("[%s] [%s] [%s] [%s]", item.Date, item.Description, item.Vendor, formatCents(item.CostCents)), "", "L", false)
+			pdf.Ln(1)
+		}
+		pdf.Ln(4)
+	}
+
+	outputPath := filepath.Join(workDir, invoiceFileName(invoiceName))
+	if err := pdf.OutputFileAndClose(outputPath); err != nil {
+		return fmt.Errorf("PDF RENDER FAILURE: failed to render output pdf file: %s: %w", filepath.Base(outputPath), err)
+	}
+	return nil
+}
+
+func expenseCategories(lineItems []invoiceLineItem) []expenseCategory {
+	indexes := make(map[string]int)
+	var categories []expenseCategory
+	for _, item := range lineItems {
+		idx, ok := indexes[item.Category]
+		if !ok {
+			idx = len(categories)
+			indexes[item.Category] = idx
+			categories = append(categories, expenseCategory{Name: item.Category})
+		}
+		categories[idx].LineItems = append(categories[idx].LineItems, item)
+		categories[idx].Total += item.CostCents
+	}
+	return categories
 }
 
 func pdfFiles(root string) ([]string, error) {
