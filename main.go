@@ -28,7 +28,6 @@ import (
 
 const (
 	maxUpload     = 512 << 20
-	configPath    = "config/.env"
 	defaultDBPath = "data/main.sqlite"
 	jobsDir       = "data/jobs"
 	usageWindow   = 24 * time.Hour
@@ -599,16 +598,11 @@ func main() {
 }
 
 func loadConfig() (appConfig, error) {
-	values, err := readEnvFile(configPath)
-	if err != nil && !errors.Is(err, os.ErrNotExist) {
-		return appConfig{}, err
-	}
-
 	get := func(key string) string {
 		if value, ok := os.LookupEnv(key); ok {
 			return strings.TrimSpace(value)
 		}
-		return strings.TrimSpace(values[key])
+		return ""
 	}
 
 	port := get("PORT")
@@ -619,11 +613,13 @@ func loadConfig() (appConfig, error) {
 	if dbPath == "" {
 		dbPath = defaultDBPath
 	}
-	if strings.HasPrefix(dbPath, ".."+string(os.PathSeparator)) || strings.HasPrefix(dbPath, "../") {
-		dbPath = filepath.Clean(filepath.Join(filepath.Dir(configPath), dbPath))
-	}
+	dbPath = filepath.Clean(dbPath)
 
-	trustProxy, err := strconv.ParseBool(defaultString(get("TRUST_PROXY"), "false"))
+	trustProxyValue := get("TRUST_PROXY")
+	if trustProxyValue == "" {
+		trustProxyValue = "false"
+	}
+	trustProxy, err := strconv.ParseBool(trustProxyValue)
 	if err != nil {
 		return appConfig{}, fmt.Errorf("TRUST_PROXY must be true or false: %w", err)
 	}
@@ -633,34 +629,6 @@ func loadConfig() (appConfig, error) {
 		DBPath:     dbPath,
 		TrustProxy: trustProxy,
 	}, nil
-}
-
-func readEnvFile(path string) (map[string]string, error) {
-	b, err := os.ReadFile(path)
-	if err != nil {
-		return nil, err
-	}
-	values := make(map[string]string)
-	lines := strings.Split(string(b), "\n")
-	for _, line := range lines {
-		line = strings.TrimSpace(line)
-		if line == "" || strings.HasPrefix(line, "#") {
-			continue
-		}
-		key, value, ok := strings.Cut(line, "=")
-		if !ok {
-			continue
-		}
-		values[strings.TrimSpace(key)] = strings.Trim(strings.TrimSpace(value), `"'`)
-	}
-	return values, nil
-}
-
-func defaultString(value, fallback string) string {
-	if value == "" {
-		return fallback
-	}
-	return value
 }
 
 func initDB(db *sql.DB) error {

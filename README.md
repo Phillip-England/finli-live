@@ -61,14 +61,6 @@ make install
 
 ## Run
 
-Optional local config:
-
-```env
-DB_PATH=data/main.sqlite
-PORT=9876
-TRUST_PROXY=false
-```
-
 ```bash
 make run
 ```
