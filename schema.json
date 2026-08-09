@@ -1,26 +1,8 @@
 {
   "variables": [
     {
-      "name": "ADMIN_USERNAME",
-      "description": "Username for the single protected admin account.",
-      "example": "admin",
-      "required": true
-    },
-    {
-      "name": "ADMIN_PASSWORD",
-      "description": "Password for the single protected admin account. Change the first-run placeholder before real deployment.",
-      "example": "change-me-now",
-      "required": true
-    },
-    {
-      "name": "SESSION_SECRET",
-      "description": "Secret key used to sign admin session cookies.",
-      "example": "replace-with-a-long-random-secret",
-      "required": true
-    },
-    {
       "name": "DB_PATH",
-      "description": "Path to the primary SQLite database used for the login failure ledger.",
+      "description": "Path to the primary SQLite database used for the public invoice-generation IP usage ledger.",
       "example": "data/main.sqlite",
       "required": false
     },

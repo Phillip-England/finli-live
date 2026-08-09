@@ -1,13 +1,9 @@
 package main
 
 import (
-	"crypto/hmac"
 	"crypto/rand"
-	"crypto/sha256"
-	"crypto/subtle"
 	"database/sql"
 	"encoding/hex"
-	"encoding/json"
 	"errors"
 	"fmt"
 	"html/template"
@@ -22,7 +18,6 @@ import (
 	"sort"
 	"strconv"
 	"strings"
-	"sync"
 	"time"
 
 	"github.com/jung-kurt/gofpdf"
@@ -32,14 +27,13 @@ import (
 )
 
 const (
-	maxUpload       = 512 << 20
-	configPath      = "config/.env"
-	defaultDBPath   = "data/main.sqlite"
-	jobsDir         = "data/jobs"
-	sessionCookie   = "finli_admin_session"
-	sessionLifetime = 12 * time.Hour
-	loginWindow     = 24 * time.Hour
-	maxFailures     = 5
+	maxUpload     = 512 << 20
+	configPath    = "config/.env"
+	defaultDBPath = "data/main.sqlite"
+	jobsDir       = "data/jobs"
+	usageWindow   = 24 * time.Hour
+	jobTTL        = 24 * time.Hour
+	maxUsesPerIP  = 10
 )
 
 var publicPage = template.Must(template.New("public").Parse(`<!doctype html>
@@ -55,67 +49,108 @@ var publicPage = template.Must(template.New("public").Parse(`<!doctype html>
   <header>
     <h1>Finli Live</h1>
     <nav>
-      <a href="/">Overview</a>
+      <a href="#generate">Generate</a>
       <a href="https://github.com/phillip-england/finli-live">GitHub</a>
     </nav>
   </header>
 
   <section class="intro">
-    <p class="eyebrow">Invoice assembly for finli receipts</p>
-    <h2>Turn a receipt folder into ready-to-send invoice packets.</h2>
-    <p>Finli Live is a browser-based invoice workflow. It takes a flat folder of PDF receipts, sorts and splits them by location, generates invoice pages, and returns complete location-specific PDF packets for download.</p>
+    <p class="eyebrow">Filename-driven invoice generation</p>
+    <h2>The invoice is generated from the receipt name itself.</h2>
+    <p>Finli Live turns a flat folder of PDFs into location-specific invoice packets by parsing a strict six-part naming schema. The name carries the date, vendor, cost, description, expense category, and location, so the app can sort receipts, split shared purchases, calculate totals, build invoice pages, and merge the final PDFs without a spreadsheet.</p>
     <div class="cta-row">
-      <a class="button-link" href="https://github.com/phillip-england/finli-live">Try it on GitHub</a>
-      <a href="#workflow">See how it works</a>
+      <a class="button-link" href="#generate">Generate invoices</a>
+      <a href="#schema">Study the schema</a>
     </div>
   </section>
 
-  <section class="process-visual" aria-label="Finli Live workflow">
-    <div><span>1</span><strong>Upload PDFs</strong></div>
-    <div><span>2</span><strong>Sort receipts</strong></div>
-    <div><span>3</span><strong>Build invoices</strong></div>
-    <div><span>4</span><strong>Download packets</strong></div>
+  <section class="schema-strip" id="schema" aria-label="Finli filename schema">
+    <code>010125-target-10.95-pants-uniforms-southroads.pdf</code>
+    <div class="schema-grid">
+      <span>Date</span>
+      <span>Vendor</span>
+      <span>Cost</span>
+      <span>Description</span>
+      <span>Category</span>
+      <span>Location</span>
+    </div>
   </section>
 
-  <section class="band" id="workflow">
+  <section class="band split" id="generate">
+    <div>
+      <div class="section-heading">
+        <p class="eyebrow">Public generator</p>
+        <h3>Upload a folder and get invoice PDFs back.</h3>
+      </div>
+      <form method="post" action="/jobs" enctype="multipart/form-data">
+        <label>
+          Invoice name
+          <input name="invoice_name" type="text" placeholder="END OF MONTH INVOICE #3" required>
+        </label>
+        <label>
+          Receipt directory
+          <input name="receipts" type="file" webkitdirectory directory multiple required>
+          <span class="hint">Upload one flat folder containing only PDFs named with the Finli schema. Locations are inferred from the filename location field.</span>
+        </label>
+        <button type="submit">Generate invoice PDFs</button>
+      </form>
+
+      {{if .Error}}<div class="error">{{.Error}}</div>{{end}}
+      {{if .JobID}}
+        <div class="result">
+          <strong>PDFs ready</strong>
+          {{range .Outputs}}
+            <a href="/jobs/{{$.JobID}}/{{.Slug}}/download">download {{.FileName}}</a>
+          {{end}}
+        </div>
+      {{end}}
+    </div>
+    <div class="rules-panel">
+      <p class="eyebrow">Daily limit</p>
+      <h3>10 generations per IP address every 24 hours.</h3>
+      <p>The public generator keeps a short-lived usage ledger in SQLite and prunes entries older than 24 hours before each request, so rate-limit data stays bounded.</p>
+    </div>
+  </section>
+
+  <section class="band">
     <div class="section-heading">
-      <p class="eyebrow">How the app works</p>
-      <h3>One focused workflow runs the full invoice process.</h3>
+      <p class="eyebrow">Why the schema matters</p>
+      <h3>Filenames become structured invoice data.</h3>
     </div>
     <div class="steps">
       <article>
         <span class="step-number">01</span>
-        <h4>Prepare the receipt folder</h4>
-        <p>Collect the receipt PDFs that belong in the invoice batch. Keep them in one folder with no nested folders, and make sure the files follow the Finli receipt filename format.</p>
+        <h4>Date</h4>
+        <p>Use six digits like 010125. This gives every invoice line a compact receipt date.</p>
       </article>
       <article>
         <span class="step-number">02</span>
-        <h4>Name the invoice batch</h4>
-        <p>Enter the invoice name exactly as it should appear on the generated invoice pages, such as an end-of-month invoice label.</p>
+        <h4>Vendor and amount</h4>
+        <p>The vendor and exact decimal cost are parsed into line items and category totals.</p>
       </article>
       <article>
         <span class="step-number">03</span>
-        <h4>Upload the directory</h4>
-        <p>Choose the full receipt directory in the browser. Finli Live accepts the files, rejects nested folders, and stores the job in a temporary job directory while it runs.</p>
+        <h4>Description and category</h4>
+        <p>These fields explain what was bought and group related spending on the invoice page.</p>
       </article>
       <article>
         <span class="step-number">04</span>
-        <h4>Download the finished PDFs</h4>
-        <p>When processing completes, each selected location gets a downloadable PDF packet with the generated invoice followed by its matching receipts.</p>
+        <h4>Location or split</h4>
+        <p>A location routes the receipt to one packet. The special split location divides the amount across every inferred location.</p>
       </article>
     </div>
   </section>
 
   <section class="band">
     <div class="section-heading">
-      <p class="eyebrow">What Finli Live does for you</p>
-      <h3>It runs the full invoice workflow in a focused web tool.</h3>
+      <p class="eyebrow">Generated outputs</p>
+      <h3>The uploaded folder becomes complete invoice packets.</h3>
     </div>
     <div class="grid">
-      <div><strong>Sorts receipts by location</strong><span>Separates uploaded PDFs into the configured location groups and splits shared receipts accurately.</span></div>
+      <div><strong>Sorts receipts by location</strong><span>Separates uploaded PDFs into inferred location groups and splits shared receipts accurately.</span></div>
       <div><strong>Generates invoice pages</strong><span>Creates the location-specific invoice cover pages using the supplied invoice name.</span></div>
       <div><strong>Merges final packets</strong><span>Combines each invoice page with its sorted receipt PDFs into a single downloadable document.</span></div>
-      <div><strong>Supports location targeting</strong><span>Uses locations.json and split targets to generate every location or only a selected subset.</span></div>
+      <div><strong>Infers locations automatically</strong><span>Scans the uploaded receipt names and generates one packet for every concrete location it finds.</span></div>
       <div><strong>Keeps jobs organized</strong><span>Stores each upload in its own job directory so generated location files stay tied to the correct batch.</span></div>
       <div><strong>Reports errors clearly</strong><span>Shows upload, sorting, generation, and merge failures so the receipt set can be corrected.</span></div>
     </div>
@@ -123,39 +158,25 @@ var publicPage = template.Must(template.New("public").Parse(`<!doctype html>
 
   <section class="band split">
     <div>
-      <p class="eyebrow">Before you upload</p>
-      <h3>Receipt folder checklist</h3>
+      <p class="eyebrow">Receipt folder</p>
+      <h3>Keep the upload intentionally simple.</h3>
       <ul>
         <li>Use one flat folder only; do not include subfolders.</li>
         <li>Upload PDF receipts only.</li>
-        <li>Use filenames in the Finli receipt format.</li>
+        <li>Name every receipt as date-vendor-cost-description-category-location.pdf.</li>
         <li>Remove duplicate, unrelated, or unfinished receipt files before generating the packet.</li>
       </ul>
     </div>
     <div>
-      <p class="eyebrow">What you get back</p>
-      <h3>Generated outputs</h3>
+      <p class="eyebrow">Automatic locations</p>
+      <h3>The folder tells Finli what to build.</h3>
       <ul>
-        <li>One PDF packet for each selected location.</li>
-        <li>Use split for every location in locations.json.</li>
-        <li>Each packet starts with its generated invoice page.</li>
-        <li>The matching receipt PDFs are merged after the invoice page.</li>
+        <li>Use a concrete location like southroads, utica, or downtown in receipt filenames.</li>
+        <li>Use split only for receipts that should be divided across inferred locations.</li>
+        <li>Include at least one non-split receipt so Finli can discover the location set.</li>
+        <li>Every inferred location receives its own generated invoice packet.</li>
       </ul>
     </div>
-  </section>
-
-  <section class="band guide">
-    <div class="section-heading">
-      <p class="eyebrow">Using the workflow</p>
-      <h3>The workflow is intentionally short.</h3>
-    </div>
-    <ol>
-      <li><strong>Enter the invoice name</strong> in the text field. This name is passed into the invoice generation step.</li>
-      <li><strong>Select the receipt directory</strong> with the folder upload control. The browser will include every PDF in that folder and the optional locations.json file.</li>
-      <li><strong>Choose the location target.</strong> Use split for all locations, or split-Southroads-Utica for a specific subset.</li>
-      <li><strong>Click Generate invoice PDF.</strong> Wait for the job to finish before leaving the page.</li>
-      <li><strong>Download each packet</strong> from the links shown after a successful run.</li>
-    </ol>
   </section>
 
   <section class="band callout">
@@ -169,121 +190,6 @@ var publicPage = template.Must(template.New("public").Parse(`<!doctype html>
   <footer>
     Made with ❤️ by <a href="https://phillip-england.com">Phillip England</a>
   </footer>
-</main>
-</body>
-</html>`))
-
-var adminPage = template.Must(template.New("admin").Parse(`<!doctype html>
-<html lang="en">
-<head>
-  <meta charset="utf-8">
-  <meta name="viewport" content="width=device-width, initial-scale=1">
-  <title>Finli Live Admin</title>
-  <style>{{template "style"}}</style>
-</head>
-<body>
-<main>
-  <header>
-    <h1>Finli Live Admin</h1>
-    <nav>
-      <a href="/">Overview</a>
-      <a href="/admin/locations">Locations JSON</a>
-      <form class="inline" method="post" action="/logout"><button type="submit" class="link-button">Logout</button></form>
-    </nav>
-  </header>
-
-  <form method="post" action="/admin/jobs" enctype="multipart/form-data">
-    <label>
-      Invoice name
-      <input name="invoice_name" type="text" placeholder="END OF MONTH INVOICE #3" required>
-    </label>
-    <label>
-      Receipt directory
-      <input name="receipts" type="file" webkitdirectory directory multiple required>
-      <span class="hint">Files must be PDFs named in the Finli receipt format. You may also include one top-level locations.json file. Uploaded directories cannot contain nested folders.</span>
-    </label>
-    <label>
-      Location target
-      <input name="location_target" type="text" value="split" required>
-      <span class="hint">Use split for every location in locations.json, or split-Southroads-Utica to generate only those locations.</span>
-    </label>
-    <button type="submit">Generate invoice PDF</button>
-  </form>
-
-  {{if .Error}}<div class="error">{{.Error}}</div>{{end}}
-  {{if .JobID}}
-    <div class="result">
-      PDFs ready:
-      {{range .Outputs}}
-        <a href="/admin/jobs/{{$.JobID}}/{{.Slug}}/download">download {{.FileName}}</a>
-      {{end}}
-    </div>
-  {{end}}
-</main>
-</body>
-</html>`))
-
-var locationsPage = template.Must(template.New("locations").Parse(`<!doctype html>
-<html lang="en">
-<head>
-  <meta charset="utf-8">
-  <meta name="viewport" content="width=device-width, initial-scale=1">
-  <title>Finli Live Locations</title>
-  <style>{{template "style"}}</style>
-</head>
-<body>
-<main>
-  <header>
-    <h1>Locations JSON</h1>
-    <nav>
-      <a href="/admin">Admin</a>
-      <form class="inline" method="post" action="/logout"><button type="submit" class="link-button">Logout</button></form>
-    </nav>
-  </header>
-
-  <form method="post" action="/admin/locations">
-    <label>
-      Locations
-      <textarea name="locations" rows="10" required>Southroads
-Utica</textarea>
-      <span class="hint">Enter one receipt location per line. The downloaded file should be included in the top level of the receipt directory upload.</span>
-    </label>
-    <button type="submit">Download locations.json</button>
-  </form>
-
-  {{if .Error}}<div class="error">{{.Error}}</div>{{end}}
-</main>
-</body>
-</html>`))
-
-var loginPage = template.Must(template.New("login").Parse(`<!doctype html>
-<html lang="en">
-<head>
-  <meta charset="utf-8">
-  <meta name="viewport" content="width=device-width, initial-scale=1">
-  <title>Finli Live Login</title>
-  <style>{{template "style"}}</style>
-</head>
-<body>
-<main class="narrow">
-  <header>
-    <h1>Admin Login</h1>
-    <nav><a href="/">Overview</a></nav>
-  </header>
-
-  <form method="post" action="/login">
-    <label>
-      Username
-      <input name="username" type="text" autocomplete="username" required>
-    </label>
-    <label>
-      Password
-      <input name="password" type="password" autocomplete="current-password" required>
-    </label>
-    <button type="submit">Log in</button>
-  </form>
-
-  {{if .Error}}<div class="error">{{.Error}}</div>{{end}}
 </main>
 </body>
 </html>`))
@@ -440,6 +346,46 @@ func init() {
       letter-spacing: 0;
       text-transform: uppercase;
     }
+    .schema-strip {
+      overflow: hidden;
+      border: 1px solid var(--line);
+      border-radius: 8px;
+      background: #ffffff;
+      margin: 8px 0 28px;
+    }
+    .schema-strip code {
+      display: block;
+      padding: 18px;
+      background: #17201a;
+      color: #f7f8f5;
+      font-size: 18px;
+      line-height: 1.4;
+      overflow-x: auto;
+    }
+    .schema-grid {
+      display: grid;
+      grid-template-columns: repeat(6, minmax(0, 1fr));
+      gap: 1px;
+      background: var(--line);
+    }
+    .schema-grid span {
+      min-height: 58px;
+      display: grid;
+      place-items: center;
+      background: linear-gradient(135deg, #ffffff 0%, #eef4ef 100%);
+      color: var(--accent);
+      font-size: 13px;
+      font-weight: 900;
+      text-transform: uppercase;
+    }
+    .rules-panel {
+      align-self: start;
+      border: 1px solid var(--line);
+      border-radius: 8px;
+      background: #ffffff;
+      padding: 20px;
+    }
+    .rules-panel p { margin-bottom: 16px; }
     .process-visual {
       display: grid;
       grid-template-columns: repeat(4, minmax(0, 1fr));
@@ -550,6 +496,10 @@ func init() {
       line-height: 1.5;
     }
     .result, .error { margin-top: 18px; }
+    .result {
+      display: grid;
+      gap: 10px;
+    }
     .error {
       border-color: #d6a59c;
       color: var(--danger);
@@ -570,12 +520,12 @@ func init() {
       button { width: 100%; }
       .button-link { width: 100%; }
       .link-button { width: auto; }
-      .process-visual, .grid, .steps, .split { grid-template-columns: 1fr; }
+      .process-visual, .schema-grid, .grid, .steps, .split { grid-template-columns: 1fr; }
       .process-visual div { min-height: 96px; }
       .cta-row, .callout { display: grid; }
     }
   {{end}}`))
-	for _, page := range []*template.Template{publicPage, adminPage, locationsPage, loginPage} {
+	for _, page := range []*template.Template{publicPage} {
 		if _, err := page.AddParseTree("style", style.Lookup("style").Tree); err != nil {
 			panic(err)
 		}
@@ -583,18 +533,14 @@ func init() {
 }
 
 type appConfig struct {
-	Port          string
-	AdminUser     string
-	AdminPassword string
-	SessionSecret []byte
-	DBPath        string
-	TrustProxy    bool
+	Port       string
+	DBPath     string
+	TrustProxy bool
 }
 
 type app struct {
-	cfg      appConfig
-	db       *sql.DB
-	sessions *sessionStore
+	cfg appConfig
+	db  *sql.DB
 }
 
 type viewData struct {
@@ -610,12 +556,23 @@ type jobOutput struct {
 }
 
 func main() {
+	if len(os.Args) > 1 && os.Args[1] == "clear-ip-bans" {
+		if err := clearIPBans(); err != nil {
+			log.Fatal(err)
+		}
+		log.Printf("cleared Finli Live IP usage ledger")
+		return
+	}
+
 	cfg, err := loadConfig()
 	if err != nil {
 		log.Fatal(err)
 	}
 	if err := os.MkdirAll(jobsDir, 0o755); err != nil {
 		log.Fatalf("failed to create %s: %v", jobsDir, err)
+	}
+	if err := pruneJobs(jobsDir, time.Now().Add(-jobTTL)); err != nil {
+		log.Printf("failed to prune old jobs: %v", err)
 	}
 	if err := os.MkdirAll(filepath.Dir(cfg.DBPath), 0o755); err != nil {
 		log.Fatalf("failed to create database directory: %v", err)
@@ -630,13 +587,11 @@ func main() {
 		log.Fatalf("failed to initialize sqlite database: %v", err)
 	}
 
-	application := &app{cfg: cfg, db: db, sessions: newSessionStore()}
+	application := &app{cfg: cfg, db: db}
 	mux := http.NewServeMux()
 	mux.HandleFunc("/", application.publicHandler)
-	mux.HandleFunc("/login", application.loginHandler)
-	mux.HandleFunc("/logout", application.logoutHandler)
-	mux.Handle("/admin", application.requireAdmin(http.HandlerFunc(application.adminHandler)))
-	mux.Handle("/admin/", application.requireAdmin(http.HandlerFunc(application.adminRoutes)))
+	mux.HandleFunc("/jobs", application.jobsHandler)
+	mux.HandleFunc("/jobs/", application.downloadHandler)
 
 	addr := "0.0.0.0:" + cfg.Port
 	log.Printf("finli-live listening on http://%s", addr)
@@ -660,13 +615,6 @@ func loadConfig() (appConfig, error) {
 	if port == "" {
 		port = "9876"
 	}
-	user := get("ADMIN_USERNAME")
-	password := get("ADMIN_PASSWORD")
-	secret := get("SESSION_SECRET")
-	if user == "" || password == "" || secret == "" {
-		return appConfig{}, fmt.Errorf("ADMIN_USERNAME, ADMIN_PASSWORD, and SESSION_SECRET must be set in %s or the environment", configPath)
-	}
-
 	dbPath := get("DB_PATH")
 	if dbPath == "" {
 		dbPath = defaultDBPath
@@ -681,12 +629,9 @@ func loadConfig() (appConfig, error) {
 	}
 
 	return appConfig{
-		Port:          strings.TrimPrefix(port, ":"),
-		AdminUser:     user,
-		AdminPassword: password,
-		SessionSecret: []byte(secret),
-		DBPath:        dbPath,
-		TrustProxy:    trustProxy,
+		Port:       strings.TrimPrefix(port, ":"),
+		DBPath:     dbPath,
+		TrustProxy: trustProxy,
 	}, nil
 }
 
@@ -720,15 +665,35 @@ func defaultString(value, fallback string) string {
 
 func initDB(db *sql.DB) error {
 	_, err := db.Exec(`
-CREATE TABLE IF NOT EXISTS login_failures (
+CREATE TABLE IF NOT EXISTS invoice_usage (
   id INTEGER PRIMARY KEY AUTOINCREMENT,
   ip TEXT NOT NULL,
-  attempted_at INTEGER NOT NULL
+  used_at INTEGER NOT NULL
 );
 
-CREATE INDEX IF NOT EXISTS idx_login_failures_ip_time
-ON login_failures (ip, attempted_at);
+CREATE INDEX IF NOT EXISTS idx_invoice_usage_ip_time
+ON invoice_usage (ip, used_at);
 `)
+	return err
+}
+
+func clearIPBans() error {
+	cfg, err := loadConfig()
+	if err != nil {
+		return err
+	}
+	if err := os.MkdirAll(filepath.Dir(cfg.DBPath), 0o755); err != nil {
+		return fmt.Errorf("failed to create database directory: %w", err)
+	}
+	db, err := sql.Open("sqlite", cfg.DBPath)
+	if err != nil {
+		return fmt.Errorf("failed to open sqlite database: %w", err)
+	}
+	defer db.Close()
+	if err := initDB(db); err != nil {
+		return fmt.Errorf("failed to initialize sqlite database: %w", err)
+	}
+	_, err = db.Exec(`DELETE FROM invoice_usage`)
 	return err
 }
 
@@ -742,158 +707,6 @@ func (a *app) publicHandler(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	renderTemplate(w, http.StatusOK, publicPage, viewData{})
-}
-
-func (a *app) loginHandler(w http.ResponseWriter, r *http.Request) {
-	switch r.Method {
-	case http.MethodGet:
-		if a.currentSession(r) != "" {
-			http.Redirect(w, r, "/admin", http.StatusSeeOther)
-			return
-		}
-		renderTemplate(w, http.StatusOK, loginPage, viewData{})
-	case http.MethodPost:
-		a.handleLogin(w, r)
-	default:
-		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
-	}
-}
-
-func (a *app) handleLogin(w http.ResponseWriter, r *http.Request) {
-	ip := a.clientIP(r)
-	now := time.Now().Unix()
-	cutoff := time.Now().Add(-loginWindow).Unix()
-	if _, err := a.db.Exec(`DELETE FROM login_failures WHERE attempted_at < ?`, cutoff); err != nil {
-		http.Error(w, "login unavailable", http.StatusInternalServerError)
-		log.Printf("failed to prune login failures: %v", err)
-		return
-	}
-
-	recent, err := a.failureCount(ip, cutoff)
-	if err != nil {
-		http.Error(w, "login unavailable", http.StatusInternalServerError)
-		log.Printf("failed to count login failures: %v", err)
-		return
-	}
-	if recent >= maxFailures {
-		http.Error(w, "too many login attempts", http.StatusForbidden)
-		return
-	}
-
-	if a.validCredentials(r.FormValue("username"), r.FormValue("password")) {
-		id, err := randomToken(32)
-		if err != nil {
-			http.Error(w, "login unavailable", http.StatusInternalServerError)
-			log.Printf("failed to create session id: %v", err)
-			return
-		}
-		a.sessions.create(id, time.Now().Add(sessionLifetime))
-		http.SetCookie(w, a.signedCookie(id, time.Now().Add(sessionLifetime)))
-		http.Redirect(w, r, "/admin", http.StatusSeeOther)
-		return
-	}
-
-	if _, err := a.db.Exec(`INSERT INTO login_failures (ip, attempted_at) VALUES (?, ?)`, ip, now); err != nil {
-		http.Error(w, "login unavailable", http.StatusInternalServerError)
-		log.Printf("failed to record login failure: %v", err)
-		return
-	}
-	recent, err = a.failureCount(ip, cutoff)
-	if err != nil {
-		http.Error(w, "login unavailable", http.StatusInternalServerError)
-		log.Printf("failed to recount login failures: %v", err)
-		return
-	}
-	if recent >= maxFailures {
-		http.Error(w, "too many login attempts", http.StatusForbidden)
-		return
-	}
-	renderTemplate(w, http.StatusUnauthorized, loginPage, viewData{Error: "Invalid username or password."})
-}
-
-func (a *app) failureCount(ip string, cutoff int64) (int, error) {
-	var count int
-	err := a.db.QueryRow(`SELECT COUNT(*) FROM login_failures WHERE ip = ? AND attempted_at >= ?`, ip, cutoff).Scan(&count)
-	return count, err
-}
-
-func (a *app) validCredentials(username, password string) bool {
-	userOK := subtle.ConstantTimeCompare([]byte(username), []byte(a.cfg.AdminUser)) == 1
-	passOK := subtle.ConstantTimeCompare([]byte(password), []byte(a.cfg.AdminPassword)) == 1
-	return userOK && passOK
-}
-
-func (a *app) logoutHandler(w http.ResponseWriter, r *http.Request) {
-	if r.Method != http.MethodPost {
-		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
-		return
-	}
-	if cookie, err := r.Cookie(sessionCookie); err == nil {
-		if id, ok := a.verifyCookie(cookie.Value); ok {
-			a.sessions.delete(id)
-		}
-	}
-	http.SetCookie(w, &http.Cookie{
-		Name:     sessionCookie,
-		Value:    "",
-		Path:     "/",
-		MaxAge:   -1,
-		HttpOnly: true,
-		SameSite: http.SameSiteLaxMode,
-	})
-	http.Redirect(w, r, "/", http.StatusSeeOther)
-}
-
-func (a *app) requireAdmin(next http.Handler) http.Handler {
-	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		if a.currentSession(r) == "" {
-			http.Redirect(w, r, "/login", http.StatusSeeOther)
-			return
-		}
-		next.ServeHTTP(w, r)
-	})
-}
-
-func (a *app) currentSession(r *http.Request) string {
-	cookie, err := r.Cookie(sessionCookie)
-	if err != nil {
-		return ""
-	}
-	id, ok := a.verifyCookie(cookie.Value)
-	if !ok || !a.sessions.valid(id) {
-		return ""
-	}
-	return id
-}
-
-func (a *app) signedCookie(id string, expires time.Time) *http.Cookie {
-	return &http.Cookie{
-		Name:     sessionCookie,
-		Value:    id + "." + a.signature(id),
-		Path:     "/",
-		Expires:  expires,
-		MaxAge:   int(sessionLifetime.Seconds()),
-		HttpOnly: true,
-		SameSite: http.SameSiteLaxMode,
-	}
-}
-
-func (a *app) verifyCookie(value string) (string, bool) {
-	id, sig, ok := strings.Cut(value, ".")
-	if !ok || id == "" || sig == "" {
-		return "", false
-	}
-	expected := a.signature(id)
-	if hmac.Equal([]byte(sig), []byte(expected)) {
-		return id, true
-	}
-	return "", false
-}
-
-func (a *app) signature(id string) string {
-	mac := hmac.New(sha256.New, a.cfg.SessionSecret)
-	mac.Write([]byte(id))
-	return hex.EncodeToString(mac.Sum(nil))
 }
 
 func (a *app) clientIP(r *http.Request) string {
@@ -915,83 +728,65 @@ func (a *app) clientIP(r *http.Request) string {
 	return r.RemoteAddr
 }
 
-func (a *app) adminHandler(w http.ResponseWriter, r *http.Request) {
-	if r.URL.Path != "/admin" {
-		http.NotFound(w, r)
-		return
-	}
-	if r.Method != http.MethodGet {
-		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
-		return
-	}
-	renderTemplate(w, http.StatusOK, adminPage, viewData{})
-}
-
-func (a *app) adminRoutes(w http.ResponseWriter, r *http.Request) {
-	switch {
-	case r.URL.Path == "/admin/jobs":
-		a.jobsHandler(w, r)
-	case r.URL.Path == "/admin/locations":
-		a.locationsHandler(w, r)
-	case strings.HasPrefix(r.URL.Path, "/admin/jobs/"):
-		a.downloadHandler(w, r)
-	default:
-		http.NotFound(w, r)
-	}
-}
-
 func (a *app) jobsHandler(w http.ResponseWriter, r *http.Request) {
 	if r.Method != http.MethodPost {
 		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
 		return
 	}
 
+	if ok, err := a.consumeGeneration(r); err != nil {
+		http.Error(w, "invoice generator unavailable", http.StatusInternalServerError)
+		log.Printf("failed to rate limit generation: %v", err)
+		return
+	} else if !ok {
+		renderTemplate(w, http.StatusTooManyRequests, publicPage, viewData{Error: "DAILY LIMIT REACHED: this IP address has used its 10 invoice generations for the last 24 hours. Try again later."})
+		return
+	}
+	if err := pruneJobs(jobsDir, time.Now().Add(-jobTTL)); err != nil {
+		log.Printf("failed to prune old jobs: %v", err)
+	}
+
 	job, err := runJob(w, r)
 	if err != nil {
-		renderTemplate(w, http.StatusBadRequest, adminPage, viewData{Error: err.Error()})
+		renderTemplate(w, http.StatusBadRequest, publicPage, viewData{Error: err.Error()})
 		return
 	}
 
-	renderTemplate(w, http.StatusOK, adminPage, viewData{
+	renderTemplate(w, http.StatusOK, publicPage, viewData{
 		JobID:   job.id,
 		Outputs: job.outputs,
 	})
 }
 
-func (a *app) locationsHandler(w http.ResponseWriter, r *http.Request) {
-	switch r.Method {
-	case http.MethodGet:
-		renderTemplate(w, http.StatusOK, locationsPage, viewData{})
-	case http.MethodPost:
-		locations, err := parseLocationLines(r.FormValue("locations"))
-		if err != nil {
-			renderTemplate(w, http.StatusBadRequest, locationsPage, viewData{Error: err.Error()})
-			return
-		}
-		payload, err := json.MarshalIndent(locationConfig{Locations: locationNames(locations)}, "", "  ")
-		if err != nil {
-			http.Error(w, "failed to create locations.json", http.StatusInternalServerError)
-			log.Printf("locations json render failed: %v", err)
-			return
-		}
-		w.Header().Set("Content-Type", "application/json")
-		w.Header().Set("Content-Disposition", `attachment; filename="locations.json"`)
-		w.WriteHeader(http.StatusOK)
-		_, _ = w.Write(append(payload, '\n'))
-	default:
-		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+func (a *app) consumeGeneration(r *http.Request) (bool, error) {
+	ip := a.clientIP(r)
+	now := time.Now()
+	cutoff := now.Add(-usageWindow).Unix()
+	if _, err := a.db.Exec(`DELETE FROM invoice_usage WHERE used_at < ?`, cutoff); err != nil {
+		return false, err
 	}
+
+	var recent int
+	if err := a.db.QueryRow(`SELECT COUNT(*) FROM invoice_usage WHERE ip = ? AND used_at >= ?`, ip, cutoff).Scan(&recent); err != nil {
+		return false, err
+	}
+	if recent >= maxUsesPerIP {
+		return false, nil
+	}
+
+	_, err := a.db.Exec(`INSERT INTO invoice_usage (ip, used_at) VALUES (?, ?)`, ip, now.Unix())
+	return err == nil, err
 }
 
 func (a *app) downloadHandler(w http.ResponseWriter, r *http.Request) {
 	parts := strings.Split(strings.Trim(r.URL.Path, "/"), "/")
-	if len(parts) != 5 || parts[0] != "admin" || parts[1] != "jobs" || parts[4] != "download" {
+	if len(parts) != 4 || parts[0] != "jobs" || parts[3] != "download" {
 		http.NotFound(w, r)
 		return
 	}
 
-	jobID := filepath.Base(parts[2])
-	location := filepath.Base(parts[3])
+	jobID := filepath.Base(parts[1])
+	location := filepath.Base(parts[2])
 	if !validLocationSlug(location) {
 		http.NotFound(w, r)
 		return
@@ -1019,41 +814,6 @@ func renderTemplate(w http.ResponseWriter, status int, tmpl *template.Template, 
 	}
 }
 
-type sessionStore struct {
-	mu       sync.Mutex
-	sessions map[string]time.Time
-}
-
-func newSessionStore() *sessionStore {
-	return &sessionStore{sessions: make(map[string]time.Time)}
-}
-
-func (s *sessionStore) create(id string, expires time.Time) {
-	s.mu.Lock()
-	defer s.mu.Unlock()
-	s.sessions[id] = expires
-}
-
-func (s *sessionStore) valid(id string) bool {
-	s.mu.Lock()
-	defer s.mu.Unlock()
-	expires, ok := s.sessions[id]
-	if !ok {
-		return false
-	}
-	if time.Now().After(expires) {
-		delete(s.sessions, id)
-		return false
-	}
-	return true
-}
-
-func (s *sessionStore) delete(id string) {
-	s.mu.Lock()
-	defer s.mu.Unlock()
-	delete(s.sessions, id)
-}
-
 type jobResult struct {
 	id      string
 	outputs []jobOutput
@@ -1065,8 +825,46 @@ type locationSpec struct {
 	TitleSuffix string
 }
 
-type locationConfig struct {
-	Locations []string `json:"locations"`
+func pruneJobs(root string, cutoff time.Time) error {
+	entries, err := os.ReadDir(root)
+	if err != nil {
+		if errors.Is(err, os.ErrNotExist) {
+			return nil
+		}
+		return err
+	}
+
+	for _, entry := range entries {
+		if !entry.IsDir() {
+			continue
+		}
+		createdAt := jobCreatedAt(entry)
+		if createdAt.IsZero() {
+			info, err := entry.Info()
+			if err != nil {
+				return err
+			}
+			createdAt = info.ModTime()
+		}
+		if createdAt.Before(cutoff) {
+			if err := os.RemoveAll(filepath.Join(root, entry.Name())); err != nil {
+				return err
+			}
+		}
+	}
+	return nil
+}
+
+func jobCreatedAt(entry os.DirEntry) time.Time {
+	name := entry.Name()
+	if len(name) < len("20060102T150405Z") {
+		return time.Time{}
+	}
+	createdAt, err := time.Parse("20060102T150405Z", name[:len("20060102T150405Z")])
+	if err != nil {
+		return time.Time{}
+	}
+	return createdAt
 }
 
 func runJob(w http.ResponseWriter, r *http.Request) (jobResult, error) {
@@ -1081,11 +879,6 @@ func runJob(w http.ResponseWriter, r *http.Request) (jobResult, error) {
 	}
 	if strings.ContainsAny(invoiceName, `/\`) {
 		return jobResult{}, errors.New("INVALID INVOICE NAME: invoice names cannot contain path separators")
-	}
-
-	locationTarget := strings.TrimSpace(r.FormValue("location_target"))
-	if locationTarget == "" {
-		locationTarget = "split"
 	}
 
 	files := r.MultipartForm.File["receipts"]
@@ -1104,26 +897,16 @@ func runJob(w http.ResponseWriter, r *http.Request) (jobResult, error) {
 	uploadDir := filepath.Join(jobRoot, "upload")
 	sortedDir := filepath.Join(jobRoot, "sorted")
 	workDir := filepath.Join(jobRoot, "work")
-	locationsPath := filepath.Join(jobRoot, "locations.json")
 	for _, dir := range []string{uploadDir, sortedDir, workDir} {
 		if err := os.MkdirAll(dir, 0o755); err != nil {
 			return jobResult{}, fmt.Errorf("JOB SETUP FAILURE: failed to create %s: %w", dir, err)
 		}
 	}
 
-	hasLocationsConfig, err := saveUploads(files, uploadDir, locationsPath)
-	if err != nil {
+	if err := saveUploads(files, uploadDir); err != nil {
 		return jobResult{}, err
 	}
-
-	locations := defaultLocations()
-	if hasLocationsConfig {
-		locations, err = readLocationsFile(locationsPath)
-		if err != nil {
-			return jobResult{}, err
-		}
-	}
-	selectedLocations, err := selectLocations(locations, locationTarget)
+	locations, err := inferLocations(uploadDir)
 	if err != nil {
 		return jobResult{}, err
 	}
@@ -1132,13 +915,13 @@ func runJob(w http.ResponseWriter, r *http.Request) (jobResult, error) {
 		return jobResult{}, err
 	}
 
-	locationParts, err := generateLocationInvoices(sortedDir, workDir, invoiceName, selectedLocations)
+	locationParts, err := generateLocationInvoices(sortedDir, workDir, invoiceName, locations)
 	if err != nil {
 		return jobResult{}, err
 	}
 
-	outputs := make([]jobOutput, 0, len(selectedLocations))
-	for _, loc := range selectedLocations {
+	outputs := make([]jobOutput, 0, len(locations))
+	for _, loc := range locations {
 		outputPDF := filepath.Join(jobRoot, loc.Slug+".pdf")
 		if err := mergePDFs(outputPDF, locationParts[loc.Slug]); err != nil {
 			return jobResult{}, err
@@ -1188,40 +971,32 @@ func generateLocationInvoices(sortedDir, workDir, invoiceName string, locations 
 	return locationParts, nil
 }
 
-func saveUploads(files []*multipart.FileHeader, receiptsDir, locationsPath string) (bool, error) {
-	hasLocationsConfig := false
+func saveUploads(files []*multipart.FileHeader, receiptsDir string) error {
 	for _, fileHeader := range files {
 		rel, err := cleanUploadPath(fileHeader.Filename)
 		if err != nil {
-			return false, err
+			return err
 		}
 
 		target := filepath.Join(receiptsDir, rel)
-		if strings.EqualFold(rel, "locations.json") {
-			if hasLocationsConfig {
-				return false, errors.New("INVALID LOCATIONS CONFIG: upload only one locations.json file")
-			}
-			hasLocationsConfig = true
-			target = locationsPath
-		}
 		if err := os.MkdirAll(filepath.Dir(target), 0o755); err != nil {
-			return false, fmt.Errorf("UPLOAD FAILURE: failed to create directory for %s: %w", rel, err)
+			return fmt.Errorf("UPLOAD FAILURE: failed to create directory for %s: %w", rel, err)
 		}
 
 		src, err := fileHeader.Open()
 		if err != nil {
-			return false, fmt.Errorf("UPLOAD FAILURE: failed to open %s: %w", rel, err)
+			return fmt.Errorf("UPLOAD FAILURE: failed to open %s: %w", rel, err)
 		}
 		err = writeUpload(target, src)
 		closeErr := src.Close()
 		if err != nil {
-			return false, err
+			return err
 		}
 		if closeErr != nil {
-			return false, fmt.Errorf("UPLOAD FAILURE: failed to close %s: %w", rel, closeErr)
+			return fmt.Errorf("UPLOAD FAILURE: failed to close %s: %w", rel, closeErr)
 		}
 	}
-	return hasLocationsConfig, nil
+	return nil
 }
 
 func cleanUploadPath(name string) (string, error) {
@@ -1236,17 +1011,10 @@ func cleanUploadPath(name string) (string, error) {
 	}
 	base := filepath.Base(clean)
 	ext := strings.ToLower(filepath.Ext(clean))
-	if ext != ".pdf" && !strings.EqualFold(base, "locations.json") {
-		return "", fmt.Errorf("INVALID FILE EXTENSION: uploaded directory must contain only .pdf files and one optional locations.json file: %s", name)
+	if ext != ".pdf" {
+		return "", fmt.Errorf("INVALID FILE EXTENSION: uploaded directory must contain only .pdf files: %s", name)
 	}
 	return base, nil
-}
-
-func defaultLocations() []locationSpec {
-	return []locationSpec{
-		mustLocationSpec("Southroads"),
-		mustLocationSpec("Utica"),
-	}
 }
 
 func mustLocationSpec(name string) locationSpec {
@@ -1257,42 +1025,73 @@ func mustLocationSpec(name string) locationSpec {
 	return loc
 }
 
-func readLocationsFile(path string) ([]locationSpec, error) {
-	b, err := os.ReadFile(path)
+func inferLocations(sourceDir string) ([]locationSpec, error) {
+	seen := make(map[string]string)
+	err := filepath.WalkDir(sourceDir, func(path string, entry fs.DirEntry, walkErr error) error {
+		if walkErr != nil {
+			return walkErr
+		}
+		if path == sourceDir {
+			return nil
+		}
+		if entry.IsDir() {
+			return errors.New("INVALID DIR CONTENTS: the provided file path must not contain any subdirectories")
+		}
+		if strings.ToLower(filepath.Ext(path)) != ".pdf" {
+			return errors.New("INVALID FILE EXTENSION: the dir must contain only .pdf files")
+		}
+
+		location, err := locationFromReceiptPath(sourceDir, path)
+		if err != nil {
+			return err
+		}
+		if location == "split" {
+			return nil
+		}
+		key := locationKey(location)
+		if key == "" {
+			return fmt.Errorf("LOCATION INFERENCE FAILURE: location %q must include at least one letter or number", location)
+		}
+		if existing, ok := seen[key]; ok && existing != location {
+			return fmt.Errorf("LOCATION INFERENCE FAILURE: duplicate inferred locations %q and %q", existing, location)
+		}
+		seen[key] = location
+		return nil
+	})
 	if err != nil {
-		return nil, fmt.Errorf("LOCATIONS CONFIG FAILURE: failed to read locations.json: %w", err)
+		return nil, fmt.Errorf("LOCATION INFERENCE FAILURE: %w", err)
 	}
 
-	var cfg locationConfig
-	if err := json.Unmarshal(b, &cfg); err != nil || len(cfg.Locations) == 0 {
-		var names []string
-		if arrayErr := json.Unmarshal(b, &names); arrayErr != nil {
-			if err != nil {
-				return nil, fmt.Errorf("LOCATIONS CONFIG FAILURE: locations.json must be an object with a locations array or a string array: %w", err)
-			}
-			return nil, fmt.Errorf("LOCATIONS CONFIG FAILURE: locations.json must be an object with a locations array or a string array: %w", arrayErr)
-		}
-		cfg.Locations = names
+	names := make([]string, 0, len(seen))
+	for _, name := range seen {
+		names = append(names, name)
 	}
-
-	return parseLocationNames(cfg.Locations)
-}
-
-func parseLocationLines(value string) ([]locationSpec, error) {
-	var names []string
-	for _, line := range strings.Split(value, "\n") {
-		line = strings.TrimSpace(line)
-		if line == "" {
-			continue
-		}
-		names = append(names, line)
+	sort.Slice(names, func(i, j int) bool {
+		return locationSlug(names[i]) < locationSlug(names[j])
+	})
+	if len(names) == 0 {
+		return nil, errors.New("LOCATION INFERENCE FAILURE: include at least one receipt with a concrete location; split-only folders do not define where to send invoices")
 	}
 	return parseLocationNames(names)
 }
 
+func locationFromReceiptPath(sourceDir, path string) (string, error) {
+	rel, err := filepath.Rel(sourceDir, path)
+	if err != nil {
+		return "", fmt.Errorf("INVALID FILE NAME: failed to resolve receipt path: %w", err)
+	}
+	trimmedPath := filepath.ToSlash(rel)
+	parts := strings.Split(trimmedPath, "-")
+	if len(parts) != 6 {
+		return "", fmt.Errorf("INVALID FILE NAME: PdfLineItem must consist of 6 distinct parts but you provided %d\n%s", len(parts), trimmedPath)
+	}
+	locationName := strings.TrimSuffix(strings.ToLower(parts[5]), ".pdf")
+	return locationSlug(locationName), nil
+}
+
 func parseLocationNames(names []string) ([]locationSpec, error) {
 	if len(names) == 0 {
-		return nil, errors.New("LOCATIONS CONFIG FAILURE: provide at least one location")
+		return nil, errors.New("LOCATION INFERENCE FAILURE: include at least one receipt with a concrete location")
 	}
 
 	seen := make(map[string]struct{}, len(names))
@@ -1304,7 +1103,7 @@ func parseLocationNames(names []string) ([]locationSpec, error) {
 		}
 		key := locationKey(loc.Name)
 		if _, ok := seen[key]; ok {
-			return nil, fmt.Errorf("LOCATIONS CONFIG FAILURE: duplicate location %q", loc.Name)
+			return nil, fmt.Errorf("LOCATION INFERENCE FAILURE: duplicate location %q", loc.Name)
 		}
 		seen[key] = struct{}{}
 		locations = append(locations, loc)
@@ -1312,66 +1111,20 @@ func parseLocationNames(names []string) ([]locationSpec, error) {
 	return locations, nil
 }
 
-func locationNames(locations []locationSpec) []string {
-	names := make([]string, 0, len(locations))
-	for _, loc := range locations {
-		names = append(names, loc.Name)
-	}
-	return names
-}
-
 func newLocationSpec(name string) (locationSpec, error) {
 	name = strings.TrimSpace(name)
 	if name == "" {
-		return locationSpec{}, errors.New("LOCATIONS CONFIG FAILURE: location names cannot be blank")
+		return locationSpec{}, errors.New("LOCATION INFERENCE FAILURE: location names cannot be blank")
 	}
 	slug := locationSlug(name)
 	if slug == "" {
-		return locationSpec{}, fmt.Errorf("LOCATIONS CONFIG FAILURE: location %q must include at least one letter or number", name)
+		return locationSpec{}, fmt.Errorf("LOCATION INFERENCE FAILURE: location %q must include at least one letter or number", name)
 	}
 	return locationSpec{
 		Name:        name,
 		Slug:        slug,
 		TitleSuffix: strings.ToUpper(name),
 	}, nil
-}
-
-func selectLocations(locations []locationSpec, target string) ([]locationSpec, error) {
-	target = strings.TrimSpace(target)
-	if strings.EqualFold(target, "split") {
-		return locations, nil
-	}
-	if !strings.HasPrefix(strings.ToLower(target), "split-") {
-		return nil, errors.New("INVALID LOCATION TARGET: use split or split-Location-AnotherLocation")
-	}
-
-	byName := make(map[string]locationSpec, len(locations))
-	for _, loc := range locations {
-		byName[locationKey(loc.Name)] = loc
-		byName[locationKey(loc.Slug)] = loc
-	}
-
-	var selected []locationSpec
-	seen := make(map[string]struct{})
-	for _, part := range strings.Split(target[len("split-"):], "-") {
-		key := locationKey(part)
-		if key == "" {
-			continue
-		}
-		loc, ok := byName[key]
-		if !ok {
-			return nil, fmt.Errorf("INVALID LOCATION TARGET: %q is not listed in locations.json", part)
-		}
-		if _, ok := seen[loc.Slug]; ok {
-			continue
-		}
-		seen[loc.Slug] = struct{}{}
-		selected = append(selected, loc)
-	}
-	if len(selected) == 0 {
-		return nil, errors.New("INVALID LOCATION TARGET: include at least one location after split-")
-	}
-	return selected, nil
 }
 
 func locationSlug(name string) string {
@@ -1582,7 +1335,7 @@ func newLineItem(sourceDir, path string, allowedLocations map[string]struct{}) (
 	locationName := strings.TrimSuffix(strings.ToLower(parts[5]), ".pdf")
 	location := locationSlug(locationName)
 	if _, ok := allowedLocations[location]; !ok {
-		return invoiceLineItem{}, fmt.Errorf("INVALID LOCATION: the 'location' field must be one of the configured locations or split\n%s", trimmedPath)
+		return invoiceLineItem{}, fmt.Errorf("INVALID LOCATION: the 'location' field must be one of the inferred locations or split\n%s", trimmedPath)
 	}
 
 	return invoiceLineItem{

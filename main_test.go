@@ -1,43 +1,15 @@
 package main
 
 import (
+	"database/sql"
+	"errors"
+	"net/http"
+	"net/http/httptest"
 	"os"
 	"path/filepath"
 	"testing"
+	"time"
 )
-
-func TestSelectLocationsSplitAll(t *testing.T) {
-	locations, err := parseLocationNames([]string{"Southroads", "Utica", "Downtown"})
-	if err != nil {
-		t.Fatal(err)
-	}
-
-	selected, err := selectLocations(locations, "split")
-	if err != nil {
-		t.Fatal(err)
-	}
-	if len(selected) != 3 {
-		t.Fatalf("expected 3 selected locations, got %d", len(selected))
-	}
-}
-
-func TestSelectLocationsSubset(t *testing.T) {
-	locations, err := parseLocationNames([]string{"Southroads", "Utica", "Downtown"})
-	if err != nil {
-		t.Fatal(err)
-	}
-
-	selected, err := selectLocations(locations, "split-Southroads-Utica")
-	if err != nil {
-		t.Fatal(err)
-	}
-	if len(selected) != 2 {
-		t.Fatalf("expected 2 selected locations, got %d", len(selected))
-	}
-	if selected[0].Slug != "southroads" || selected[1].Slug != "utica" {
-		t.Fatalf("unexpected locations: %#v", selected)
-	}
-}
 
 func TestParseLocationNamesRejectsDuplicates(t *testing.T) {
 	_, err := parseLocationNames([]string{"Southroads", "south roads"})
@@ -47,7 +19,10 @@ func TestParseLocationNamesRejectsDuplicates(t *testing.T) {
 }
 
 func TestSplitLineItemPreservesDefaultPennyBehavior(t *testing.T) {
-	locations := defaultLocations()
+	locations, err := parseLocationNames([]string{"Southroads", "Utica"})
+	if err != nil {
+		t.Fatal(err)
+	}
 	item := invoiceLineItem{
 		Date:        "010125",
 		Vendor:      "Vendor",
@@ -104,9 +79,127 @@ func TestSortReceiptsSupportsConfiguredLocations(t *testing.T) {
 	}
 }
 
+func TestInferLocationsFromConcreteReceiptNames(t *testing.T) {
+	root := t.TempDir()
+	writeTestPDF(t, filepath.Join(root, "010125-Vendor-3.01-Paper-Office-north.pdf"))
+	writeTestPDF(t, filepath.Join(root, "010225-Vendor-6-Supplies-Office-split.pdf"))
+	writeTestPDF(t, filepath.Join(root, "010325-Vendor-4-Food-Meals-south.pdf"))
+
+	locations, err := inferLocations(root)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(locations) != 2 {
+		t.Fatalf("expected 2 inferred locations, got %d", len(locations))
+	}
+	if locations[0].Slug != "north" || locations[1].Slug != "south" {
+		t.Fatalf("unexpected inferred locations: %#v", locations)
+	}
+}
+
+func TestInferLocationsRejectsSplitOnlyFolders(t *testing.T) {
+	root := t.TempDir()
+	writeTestPDF(t, filepath.Join(root, "010225-Vendor-6-Supplies-Office-split.pdf"))
+
+	_, err := inferLocations(root)
+	if err == nil {
+		t.Fatal("expected split-only folder to fail location inference")
+	}
+}
+
+func TestConsumeGenerationAllowsTenUsesPerWindow(t *testing.T) {
+	db := newTestDB(t)
+	application := &app{db: db}
+
+	for i := 0; i < maxUsesPerIP; i++ {
+		ok, err := application.consumeGeneration(testRequestFromIP("203.0.113.10"))
+		if err != nil {
+			t.Fatal(err)
+		}
+		if !ok {
+			t.Fatalf("generation %d was unexpectedly limited", i+1)
+		}
+	}
+
+	ok, err := application.consumeGeneration(testRequestFromIP("203.0.113.10"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if ok {
+		t.Fatal("expected eleventh generation to be rate limited")
+	}
+}
+
+func TestConsumeGenerationPrunesExpiredUsage(t *testing.T) {
+	db := newTestDB(t)
+	application := &app{db: db}
+
+	expired := time.Now().Add(-usageWindow).Add(-time.Minute).Unix()
+	if _, err := db.Exec(`INSERT INTO invoice_usage (ip, used_at) VALUES (?, ?)`, "203.0.113.20", expired); err != nil {
+		t.Fatal(err)
+	}
+
+	ok, err := application.consumeGeneration(testRequestFromIP("203.0.113.20"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !ok {
+		t.Fatal("expected expired usage to be pruned before limiting")
+	}
+
+	var count int
+	if err := db.QueryRow(`SELECT COUNT(*) FROM invoice_usage WHERE used_at < ?`, time.Now().Add(-usageWindow).Unix()).Scan(&count); err != nil {
+		t.Fatal(err)
+	}
+	if count != 0 {
+		t.Fatalf("expected expired usage rows to be pruned, got %d", count)
+	}
+}
+
+func TestPruneJobsRemovesExpiredJobDirectories(t *testing.T) {
+	root := t.TempDir()
+	oldJob := filepath.Join(root, time.Now().Add(-48*time.Hour).UTC().Format("20060102T150405Z")+"-old")
+	newJob := filepath.Join(root, time.Now().UTC().Format("20060102T150405Z")+"-new")
+	if err := os.MkdirAll(oldJob, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.MkdirAll(newJob, 0o755); err != nil {
+		t.Fatal(err)
+	}
+
+	if err := pruneJobs(root, time.Now().Add(-jobTTL)); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := os.Stat(oldJob); !errors.Is(err, os.ErrNotExist) {
+		t.Fatalf("expected old job to be removed, stat err: %v", err)
+	}
+	if _, err := os.Stat(newJob); err != nil {
+		t.Fatalf("expected new job to remain: %v", err)
+	}
+}
+
 func writeTestPDF(t *testing.T, path string) {
 	t.Helper()
 	if err := os.WriteFile(path, []byte("%PDF-1.4\n%%EOF\n"), 0o644); err != nil {
 		t.Fatal(err)
 	}
+}
+
+func newTestDB(t *testing.T) *sql.DB {
+	t.Helper()
+	db, err := sql.Open("sqlite", ":memory:")
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = db.Close() })
+	if err := initDB(db); err != nil {
+		t.Fatal(err)
+	}
+	return db
+}
+
+func testRequestFromIP(ip string) *http.Request {
+	req := httptest.NewRequest("POST", "/jobs", nil)
+	req.RemoteAddr = ip + ":12345"
+	return req
 }
