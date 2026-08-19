@@ -7,6 +7,7 @@ import (
 	"net/http/httptest"
 	"os"
 	"path/filepath"
+	"strings"
 	"testing"
 	"time"
 )
@@ -175,6 +176,22 @@ func TestPruneJobsRemovesExpiredJobDirectories(t *testing.T) {
 	}
 	if _, err := os.Stat(newJob); err != nil {
 		t.Fatalf("expected new job to remain: %v", err)
+	}
+}
+
+func TestMergePDFsIdentifiesInvalidInput(t *testing.T) {
+	root := t.TempDir()
+	badPDF := filepath.Join(root, "010125-Vendor-3.01-Paper-Office-north.pdf")
+	if err := os.WriteFile(badPDF, []byte("this is not actually a PDF"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	err := mergePDFs(filepath.Join(root, "merged.pdf"), []string{badPDF})
+	if err == nil {
+		t.Fatal("expected invalid PDF to fail")
+	}
+	if !strings.Contains(err.Error(), filepath.Base(badPDF)) {
+		t.Fatalf("expected error to identify %q, got %q", filepath.Base(badPDF), err)
 	}
 }
 

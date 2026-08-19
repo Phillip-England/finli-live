@@ -1444,6 +1444,14 @@ func mergePDFs(out string, files []string) error {
 		return errors.New("PDF MERGE FAILURE: no PDF files were provided")
 	}
 	conf := model.NewDefaultConfiguration()
+	// pdfcpu's merge error does not include the input path, which makes a bad
+	// receipt look like a problem with the entire directory. Validate each part
+	// first so the user can identify and replace the actual offending file.
+	for _, file := range files {
+		if err := api.ValidateFile(file, conf); err != nil {
+			return fmt.Errorf("PDF MERGE FAILURE: invalid PDF %q: %w", filepath.Base(file), err)
+		}
+	}
 	if err := api.MergeCreateFile(files, out, false, conf); err != nil {
 		return fmt.Errorf("PDF MERGE FAILURE: %w", err)
 	}
