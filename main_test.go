@@ -157,6 +157,50 @@ func TestConsumeGenerationPrunesExpiredUsage(t *testing.T) {
 	}
 }
 
+func TestFormInvoiceAllowsTwentyFiveUsesPerWindow(t *testing.T) {
+	db := newTestDB(t)
+	application := &app{db: db}
+	req := testRequestFromIP("203.0.113.30")
+	for i := 0; i < maxFormInvoicesPerIP; i++ {
+		ok, err := application.consumeUsage(req, "form_invoice_usage", maxFormInvoicesPerIP)
+		if err != nil || !ok {
+			t.Fatalf("form invoice %d was unexpectedly limited: ok=%v err=%v", i+1, ok, err)
+		}
+	}
+	ok, err := application.consumeUsage(req, "form_invoice_usage", maxFormInvoicesPerIP)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if ok {
+		t.Fatal("expected twenty-sixth form invoice to be rate limited")
+	}
+}
+
+func TestParseFormInvoiceSupportsMultipleSplitLocations(t *testing.T) {
+	body := strings.NewReader("invoice_name=September+expenses&invoice_date=2026-09-01&locations=North&locations=South&locations=West&line_3_date=2026-08-31&line_3_vendor=Acme&line_3_description=Paper&line_3_category=Office&line_3_amount=10.01&line_locations_3=0&line_locations_3=1&line_locations_3=2")
+	req := httptest.NewRequest(http.MethodPost, "/invoices", body)
+	req.Header.Set("Content-Type", "application/x-www-form-urlencoded")
+
+	invoice, err := parseFormInvoice(req)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(invoice.Items) != 1 || len(invoice.Items[0].Locations) != 3 {
+		t.Fatalf("unexpected parsed invoice: %#v", invoice)
+	}
+	if invoice.Items[0].CostCents != 1001 {
+		t.Fatalf("expected 1001 cents, got %d", invoice.Items[0].CostCents)
+	}
+
+	path := filepath.Join(t.TempDir(), "invoice.pdf")
+	if err := generateFormInvoicePDF(path, invoice); err != nil {
+		t.Fatal(err)
+	}
+	if info, err := os.Stat(path); err != nil || info.Size() == 0 {
+		t.Fatalf("expected generated PDF, info=%v err=%v", info, err)
+	}
+}
+
 func TestPruneJobsRemovesExpiredJobDirectories(t *testing.T) {
 	root := t.TempDir()
 	oldJob := filepath.Join(root, time.Now().Add(-48*time.Hour).UTC().Format("20060102T150405Z")+"-old")
