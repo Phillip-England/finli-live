@@ -1608,7 +1608,7 @@ func generateInvoicePDF(workDir, receiptDir, invoiceName string) error {
 		pdf.Ln(1)
 		pdf.SetFont("Helvetica", "", 12)
 		for _, item := range category.LineItems {
-			pdf.MultiCell(0, 6, fmt.Sprintf("[%s] [%s] [%s] [%s]", item.Date, item.Description, item.Vendor, formatCents(item.CostCents)), "", "L", false)
+			pdf.MultiCell(0, 6, fmt.Sprintf("%s - %s - %s - %s", item.Date, item.Description, item.Vendor, formatCents(item.CostCents)), "", "L", false)
 			pdf.Ln(1)
 		}
 		pdf.Ln(4)
